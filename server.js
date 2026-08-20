@@ -1,7 +1,7 @@
 const sessionUpdate = {
   type: "session.update",
   session: {
-    voice: process.env.AGENT_VOICE || "eve",
+    voice: process.env.AGENT_VOICE || "Carina",
     instructions: `You are Amber, an outbound voice agent calling on behalf of The Home Health Team.
 Your goal is to prepare the patient for the start of home health services and collect a few important details for the care team.
 
