@@ -8,6 +8,7 @@ const https = require("https");
 const app = express();
 expressWs(app);
 app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
 
 const PORT = process.env.PORT || 3000;
 const XAI_API_KEY = process.env.XAI_API_KEY;
@@ -19,9 +20,17 @@ const HOSTNAME = process.env.RENDER_EXTERNAL_URL || process.env.HOSTNAME;
 const AGENT_VOICE = process.env.AGENT_VOICE || "eve";
 const ZAPIER_WEBHOOK_URL = process.env.ZAPIER_WEBHOOK_URL;
 
-// Instruction sets
 const AGENT_INSTRUCTIONS_WELCOME = process.env.AGENT_INSTRUCTIONS_WELCOME || process.env.AGENT_INSTRUCTIONS || "You are a helpful assistant.";
-const AGENT_INSTRUCTIONS_PATIENT_UPDATE = process.env.AGENT_INSTRUCTIONS_PATIENT_UPDATE || process.env.AGENT_INSTRUCTIONS_EXPERIENCE || "You are a helpful assistant calling to check on the patient's experience and how they are feeling.";
+const AGENT_INSTRUCTIONS_PATIENT_UPDATE = process.env.AGENT_INSTRUCTIONS_PATIENT_UPDATE || process.env.AGENT_INSTRUCTIONS_EXPERIENCE || "You are a helpful assistant calling to check on the patient.";
+
+// Department phone numbers
+const TRANSFER_NUMBERS = {
+  clinical: "+12148107225",
+  nurse: "+12142530980",
+  therapy: "+12148077411",
+  billing: "+12142530980",
+  admin: "+12148077860",
+};
 
 if (!XAI_API_KEY || !TWILIO_ACCOUNT_SID || !TWILIO_AUTH_TOKEN || !TWILIO_PHONE_NUMBER) {
   console.error("Missing required environment variables");
@@ -54,10 +63,7 @@ function sendToZapier(payload) {
       console.log(`Zapier webhook response: ${res.statusCode}`);
     });
 
-    req.on("error", (err) => {
-      console.error("Error sending to Zapier:", err.message);
-    });
-
+    req.on("error", (err) => console.error("Error sending to Zapier:", err.message));
     req.write(data);
     req.end();
   } catch (err) {
@@ -65,6 +71,7 @@ function sendToZapier(payload) {
   }
 }
 
+// Start outbound call
 app.post("/api/call", async (req, res) => {
   try {
     const { to, patient_name, agent_type = "welcome" } = req.body;
@@ -90,6 +97,7 @@ app.post("/api/call", async (req, res) => {
   }
 });
 
+// TwiML that starts the Media Stream
 app.post("/outbound-twiml", (req, res) => {
   const patientName = req.query.patient_name || "there";
   const phoneNumber = req.query.phone_number || "";
@@ -109,10 +117,28 @@ app.post("/outbound-twiml", (req, res) => {
   res.type("text/xml").send(twiml);
 });
 
+// TwiML used when transferring the call
+app.post("/transfer-twiml", (req, res) => {
+  const department = req.query.department || "admin";
+  const targetNumber = TRANSFER_NUMBERS[department] || TRANSFER_NUMBERS.admin;
+
+  console.log(`Transferring call to ${department}: ${targetNumber}`);
+
+  const twiml = `<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+  <Say>Please hold while I connect you.</Say>
+  <Dial>${targetNumber}</Dial>
+</Response>`;
+
+  res.type("text/xml").send(twiml);
+});
+
+// Media Stream ↔ xAI bridge
 app.ws("/media-stream", (twilioWs, req) => {
   console.log("Twilio Media Stream connected");
 
   let streamSid = null;
+  let callSid = null;
   let patientName = "there";
   let phoneNumber = "unknown";
   let agentType = "welcome";
@@ -127,12 +153,12 @@ app.ws("/media-stream", (twilioWs, req) => {
     switch (data.event) {
       case "start":
         streamSid = data.start.streamSid;
+        callSid = data.start.callSid;
         patientName = data.start.customParameters?.patient_name || "there";
         phoneNumber = data.start.customParameters?.phone_number || "unknown";
         agentType = data.start.customParameters?.agent_type || "welcome";
-        console.log(`Stream started | Patient: ${patientName} | Type: ${agentType}`);
+        console.log(`Stream started | Patient: ${patientName} | Type: ${agentType} | CallSid: ${callSid}`);
 
-        // Choose instructions based on agent_type
         let baseInstructions = AGENT_INSTRUCTIONS_WELCOME;
         if (agentType === "patient_update" || agentType === "experience") {
           baseInstructions = AGENT_INSTRUCTIONS_PATIENT_UPDATE;
@@ -147,7 +173,10 @@ app.ws("/media-stream", (twilioWs, req) => {
 
           const fullInstructions = `${baseInstructions}
 
-The patient's name is ${patientName}. Always address them by name and confirm you are speaking with them at the beginning of the call.`;
+The patient's name is ${patientName}. Always address them by name and confirm you are speaking with them at the beginning of the call.
+
+You have a tool called transfer_call. Use it when the patient wants to be transferred to a department.
+Available departments: clinical, nurse, therapy, billing, admin.`;
 
           const sessionUpdate = {
             type: "session.update",
@@ -155,6 +184,24 @@ The patient's name is ${patientName}. Always address them by name and confirm yo
               voice: AGENT_VOICE,
               instructions: fullInstructions,
               turn_detection: { type: "server_vad" },
+              tools: [
+                {
+                  type: "function",
+                  name: "transfer_call",
+                  description: "Transfer the current call to a specific department. Use this when the patient asks to speak with clinical management, nurse scheduling, therapy scheduling, billing, or administration.",
+                  parameters: {
+                    type: "object",
+                    properties: {
+                      department: {
+                        type: "string",
+                        enum: ["clinical", "nurse", "therapy", "billing", "admin"],
+                        description: "The department to transfer the call to"
+                      }
+                    },
+                    required: ["department"]
+                  }
+                }
+              ],
               audio: {
                 input:  { format: { type: "audio/pcmu" } },
                 output: { format: { type: "audio/pcmu" } },
@@ -167,7 +214,7 @@ The patient's name is ${patientName}. Always address them by name and confirm yo
           sessionReady = true;
         });
 
-        xaiWs.on("message", (xaiMsg) => {
+        xaiWs.on("message", async (xaiMsg) => {
           const event = JSON.parse(xaiMsg.toString());
 
           console.log("xAI event:", event.type);
@@ -176,7 +223,29 @@ The patient's name is ${patientName}. Always address them by name and confirm yo
             console.error("xAI error details:", JSON.stringify(event, null, 2));
           }
 
-          // Clean transcript collection
+          // Handle tool call (transfer)
+          if (event.type === "response.function_call_arguments.done") {
+            try {
+              const args = JSON.parse(event.arguments || "{}");
+              const department = args.department || "admin";
+              console.log(`Agent requested transfer to: ${department}`);
+
+              if (callSid) {
+                const transferUrl = `${HOSTNAME}/transfer-twiml?department=${encodeURIComponent(department)}`;
+
+                await twilioClient.calls(callSid).update({
+                  url: transferUrl,
+                  method: "POST",
+                });
+
+                console.log(`Call ${callSid} redirected to ${department}`);
+              }
+            } catch (err) {
+              console.error("Transfer failed:", err.message);
+            }
+          }
+
+          // Transcript collection
           if (event.type === "response.output_audio_transcript.done" && event.transcript) {
             const text = event.transcript.trim();
             if (text && (transcript.length === 0 || transcript[transcript.length - 1].text !== text)) {
@@ -191,6 +260,7 @@ The patient's name is ${patientName}. Always address them by name and confirm yo
             }
           }
 
+          // Audio to Twilio
           if (event.type === "response.output_audio.delta" && event.delta) {
             if (twilioWs.readyState === WebSocket.OPEN) {
               twilioWs.send(JSON.stringify({
