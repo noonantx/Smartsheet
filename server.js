@@ -27,7 +27,7 @@ if (!XAI_API_KEY || !TWILIO_ACCOUNT_SID || !TWILIO_AUTH_TOKEN || !TWILIO_PHONE_N
 
 const twilioClient = twilio(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN);
 
-// Helper function to send data to Zapier
+// Helper to send data to Zapier
 function sendToZapier(payload) {
   if (!ZAPIER_WEBHOOK_URL) {
     console.log("No ZAPIER_WEBHOOK_URL set – skipping summary");
@@ -63,7 +63,7 @@ function sendToZapier(payload) {
   }
 }
 
-// Zapier / Smartsheet calls this endpoint to start a call
+// Start outbound call
 app.post("/api/call", async (req, res) => {
   try {
     const { to, patient_name } = req.body;
@@ -72,7 +72,8 @@ app.post("/api/call", async (req, res) => {
       return res.status(400).json({ error: "Missing 'to' or 'patient_name'" });
     }
 
-    const twimlUrl = `${HOSTNAME}/outbound-twiml?patient_name=${encodeURIComponent(patient_name)}`;
+    // Pass both patient name and phone number as custom parameters
+    const twimlUrl = `${HOSTNAME}/outbound-twiml?patient_name=${encodeURIComponent(patient_name)}&phone_number=${encodeURIComponent(to)}`;
 
     const call = await twilioClient.calls.create({
       to,
@@ -89,15 +90,17 @@ app.post("/api/call", async (req, res) => {
   }
 });
 
-// TwiML that starts the Media Stream
+// TwiML – start Media Stream and pass custom parameters
 app.post("/outbound-twiml", (req, res) => {
   const patientName = req.query.patient_name || "there";
+  const phoneNumber = req.query.phone_number || "";
 
   const twiml = `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
   <Connect>
     <Stream url="wss://${req.get("host")}/media-stream">
       <Parameter name="patient_name" value="${patientName}" />
+      <Parameter name="phone_number" value="${phoneNumber}" />
     </Stream>
   </Connect>
 </Response>`;
@@ -111,6 +114,7 @@ app.ws("/media-stream", (twilioWs, req) => {
 
   let streamSid = null;
   let patientName = "there";
+  let phoneNumber = "unknown";
   let xaiWs = null;
   let sessionReady = false;
   let transcript = [];
@@ -123,7 +127,8 @@ app.ws("/media-stream", (twilioWs, req) => {
       case "start":
         streamSid = data.start.streamSid;
         patientName = data.start.customParameters?.patient_name || "there";
-        console.log(`Stream started | Patient: ${patientName}`);
+        phoneNumber = data.start.customParameters?.phone_number || "unknown";
+        console.log(`Stream started | Patient: ${patientName} | Phone: ${phoneNumber}`);
 
         xaiWs = new WebSocket("wss://api.x.ai/v1/realtime?model=grok-voice-latest", {
           headers: { Authorization: `Bearer ${XAI_API_KEY}` },
@@ -163,18 +168,16 @@ The patient's name is ${patientName}. Always address them by name and confirm yo
             console.error("xAI error details:", JSON.stringify(event, null, 2));
           }
 
-          // Collect transcripts
-          if (event.type === "response.output_audio_transcript.delta" && event.delta) {
-            transcript.push({ speaker: "Agent", text: event.delta });
-          }
+          // Prefer final transcripts to reduce duplication
           if (event.type === "response.output_audio_transcript.done" && event.transcript) {
             transcript.push({ speaker: "Agent", text: event.transcript });
           }
+
           if (event.type === "conversation.item.input_audio_transcription.completed" && event.transcript) {
             transcript.push({ speaker: "Patient", text: event.transcript });
           }
 
-          // Send audio back to Twilio
+          // Send audio to Twilio
           if (event.type === "response.output_audio.delta" && event.delta) {
             if (twilioWs.readyState === WebSocket.OPEN) {
               twilioWs.send(JSON.stringify({
@@ -213,7 +216,7 @@ The patient's name is ${patientName}. Always address them by name and confirm yo
 
         const summaryPayload = {
           patient_name: patientName,
-          phone_number: "unknown",
+          phone_number: phoneNumber,
           timestamp: callStartTime,
           transcript: fullTranscript || "No transcript captured",
           summary: `Call with ${patientName} completed. See transcript for details.`,
