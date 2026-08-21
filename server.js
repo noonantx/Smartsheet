@@ -72,7 +72,6 @@ app.post("/api/call", async (req, res) => {
       return res.status(400).json({ error: "Missing 'to' or 'patient_name'" });
     }
 
-    // Pass both patient name and phone number as custom parameters
     const twimlUrl = `${HOSTNAME}/outbound-twiml?patient_name=${encodeURIComponent(patient_name)}&phone_number=${encodeURIComponent(to)}`;
 
     const call = await twilioClient.calls.create({
@@ -90,7 +89,7 @@ app.post("/api/call", async (req, res) => {
   }
 });
 
-// TwiML – start Media Stream and pass custom parameters
+// TwiML that starts the Media Stream
 app.post("/outbound-twiml", (req, res) => {
   const patientName = req.query.patient_name || "there";
   const phoneNumber = req.query.phone_number || "";
@@ -168,13 +167,19 @@ The patient's name is ${patientName}. Always address them by name and confirm yo
             console.error("xAI error details:", JSON.stringify(event, null, 2));
           }
 
-          // Prefer final transcripts to reduce duplication
+          // Clean transcript collection (final versions only + simple de-dupe)
           if (event.type === "response.output_audio_transcript.done" && event.transcript) {
-            transcript.push({ speaker: "Agent", text: event.transcript });
+            const text = event.transcript.trim();
+            if (text && (transcript.length === 0 || transcript[transcript.length - 1].text !== text)) {
+              transcript.push({ speaker: "Agent", text });
+            }
           }
 
           if (event.type === "conversation.item.input_audio_transcription.completed" && event.transcript) {
-            transcript.push({ speaker: "Patient", text: event.transcript });
+            const text = event.transcript.trim();
+            if (text && (transcript.length === 0 || transcript[transcript.length - 1].text !== text)) {
+              transcript.push({ speaker: "Patient", text });
+            }
           }
 
           // Send audio to Twilio
