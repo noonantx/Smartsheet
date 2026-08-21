@@ -16,9 +16,12 @@ const TWILIO_AUTH_TOKEN = process.env.TWILIO_AUTH_TOKEN;
 const TWILIO_PHONE_NUMBER = process.env.TWILIO_PHONE_NUMBER;
 const VERIFIED_CALLER_ID = process.env.VERIFIED_CALLER_ID;
 const HOSTNAME = process.env.RENDER_EXTERNAL_URL || process.env.HOSTNAME;
-const AGENT_INSTRUCTIONS = process.env.AGENT_INSTRUCTIONS || "You are a helpful assistant.";
 const AGENT_VOICE = process.env.AGENT_VOICE || "eve";
 const ZAPIER_WEBHOOK_URL = process.env.ZAPIER_WEBHOOK_URL;
+
+// Instruction sets
+const AGENT_INSTRUCTIONS_WELCOME = process.env.AGENT_INSTRUCTIONS_WELCOME || process.env.AGENT_INSTRUCTIONS || "You are a helpful assistant.";
+const AGENT_INSTRUCTIONS_PATIENT_UPDATE = process.env.AGENT_INSTRUCTIONS_PATIENT_UPDATE || process.env.AGENT_INSTRUCTIONS_EXPERIENCE || "You are a helpful assistant calling to check on the patient's experience and how they are feeling.";
 
 if (!XAI_API_KEY || !TWILIO_ACCOUNT_SID || !TWILIO_AUTH_TOKEN || !TWILIO_PHONE_NUMBER) {
   console.error("Missing required environment variables");
@@ -27,7 +30,6 @@ if (!XAI_API_KEY || !TWILIO_ACCOUNT_SID || !TWILIO_AUTH_TOKEN || !TWILIO_PHONE_N
 
 const twilioClient = twilio(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN);
 
-// Helper to send data to Zapier
 function sendToZapier(payload) {
   if (!ZAPIER_WEBHOOK_URL) {
     console.log("No ZAPIER_WEBHOOK_URL set – skipping summary");
@@ -63,16 +65,15 @@ function sendToZapier(payload) {
   }
 }
 
-// Start outbound call
 app.post("/api/call", async (req, res) => {
   try {
-    const { to, patient_name } = req.body;
+    const { to, patient_name, agent_type = "welcome" } = req.body;
 
     if (!to || !patient_name) {
       return res.status(400).json({ error: "Missing 'to' or 'patient_name'" });
     }
 
-    const twimlUrl = `${HOSTNAME}/outbound-twiml?patient_name=${encodeURIComponent(patient_name)}&phone_number=${encodeURIComponent(to)}`;
+    const twimlUrl = `${HOSTNAME}/outbound-twiml?patient_name=${encodeURIComponent(patient_name)}&phone_number=${encodeURIComponent(to)}&agent_type=${encodeURIComponent(agent_type)}`;
 
     const call = await twilioClient.calls.create({
       to,
@@ -81,7 +82,7 @@ app.post("/api/call", async (req, res) => {
       method: "POST",
     });
 
-    console.log(`Call started → ${to} | SID: ${call.sid} | Name: ${patient_name}`);
+    console.log(`Call started → ${to} | SID: ${call.sid} | Name: ${patient_name} | Type: ${agent_type}`);
     res.json({ success: true, callSid: call.sid });
   } catch (err) {
     console.error("Call failed:", err.message);
@@ -89,10 +90,10 @@ app.post("/api/call", async (req, res) => {
   }
 });
 
-// TwiML that starts the Media Stream
 app.post("/outbound-twiml", (req, res) => {
   const patientName = req.query.patient_name || "there";
   const phoneNumber = req.query.phone_number || "";
+  const agentType = req.query.agent_type || "welcome";
 
   const twiml = `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
@@ -100,6 +101,7 @@ app.post("/outbound-twiml", (req, res) => {
     <Stream url="wss://${req.get("host")}/media-stream">
       <Parameter name="patient_name" value="${patientName}" />
       <Parameter name="phone_number" value="${phoneNumber}" />
+      <Parameter name="agent_type" value="${agentType}" />
     </Stream>
   </Connect>
 </Response>`;
@@ -107,13 +109,13 @@ app.post("/outbound-twiml", (req, res) => {
   res.type("text/xml").send(twiml);
 });
 
-// Media Stream ↔ xAI bridge
 app.ws("/media-stream", (twilioWs, req) => {
   console.log("Twilio Media Stream connected");
 
   let streamSid = null;
   let patientName = "there";
   let phoneNumber = "unknown";
+  let agentType = "welcome";
   let xaiWs = null;
   let sessionReady = false;
   let transcript = [];
@@ -127,7 +129,14 @@ app.ws("/media-stream", (twilioWs, req) => {
         streamSid = data.start.streamSid;
         patientName = data.start.customParameters?.patient_name || "there";
         phoneNumber = data.start.customParameters?.phone_number || "unknown";
-        console.log(`Stream started | Patient: ${patientName} | Phone: ${phoneNumber}`);
+        agentType = data.start.customParameters?.agent_type || "welcome";
+        console.log(`Stream started | Patient: ${patientName} | Type: ${agentType}`);
+
+        // Choose instructions based on agent_type
+        let baseInstructions = AGENT_INSTRUCTIONS_WELCOME;
+        if (agentType === "patient_update" || agentType === "experience") {
+          baseInstructions = AGENT_INSTRUCTIONS_PATIENT_UPDATE;
+        }
 
         xaiWs = new WebSocket("wss://api.x.ai/v1/realtime?model=grok-voice-latest", {
           headers: { Authorization: `Bearer ${XAI_API_KEY}` },
@@ -136,7 +145,7 @@ app.ws("/media-stream", (twilioWs, req) => {
         xaiWs.on("open", () => {
           console.log("Connected to xAI Realtime");
 
-          const fullInstructions = `${AGENT_INSTRUCTIONS}
+          const fullInstructions = `${baseInstructions}
 
 The patient's name is ${patientName}. Always address them by name and confirm you are speaking with them at the beginning of the call.`;
 
@@ -167,7 +176,7 @@ The patient's name is ${patientName}. Always address them by name and confirm yo
             console.error("xAI error details:", JSON.stringify(event, null, 2));
           }
 
-          // Clean transcript collection (final versions only + simple de-dupe)
+          // Clean transcript collection
           if (event.type === "response.output_audio_transcript.done" && event.transcript) {
             const text = event.transcript.trim();
             if (text && (transcript.length === 0 || transcript[transcript.length - 1].text !== text)) {
@@ -182,7 +191,6 @@ The patient's name is ${patientName}. Always address them by name and confirm yo
             }
           }
 
-          // Send audio to Twilio
           if (event.type === "response.output_audio.delta" && event.delta) {
             if (twilioWs.readyState === WebSocket.OPEN) {
               twilioWs.send(JSON.stringify({
@@ -222,9 +230,10 @@ The patient's name is ${patientName}. Always address them by name and confirm yo
         const summaryPayload = {
           patient_name: patientName,
           phone_number: phoneNumber,
+          agent_type: agentType,
           timestamp: callStartTime,
           transcript: fullTranscript || "No transcript captured",
-          summary: `Call with ${patientName} completed. See transcript for details.`,
+          summary: `Call with ${patientName} (${agentType}) completed. See transcript for details.`,
         };
 
         sendToZapier(summaryPayload);
