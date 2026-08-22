@@ -31,10 +31,12 @@ const TRANSFER_NUMBERS = {
   admin: "+12148077860",
 };
 
-// ===== Simple Queue Settings =====
-const MAX_CONCURRENT_CALLS = 8;          // Maximum calls running at the same time
-const callQueue = [];                    // Waiting calls
-let activeCallsCount = 0;                // Currently running calls
+// ===== Improved Queue =====
+const MAX_CONCURRENT_CALLS = 8;
+const CALL_TIMEOUT_MS = 60000; // 60 seconds – free the slot if call never connects
+
+const callQueue = [];                 // jobs waiting to start
+const activeCalls = new Map();        // callSid → { finished: boolean, timeout }
 
 if (!XAI_API_KEY || !TWILIO_ACCOUNT_SID || !TWILIO_AUTH_TOKEN || !TWILIO_PHONE_NUMBER) {
   console.error("Missing required environment variables");
@@ -44,10 +46,7 @@ if (!XAI_API_KEY || !TWILIO_ACCOUNT_SID || !TWILIO_AUTH_TOKEN || !TWILIO_PHONE_N
 const twilioClient = twilio(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN);
 
 function sendToZapier(payload) {
-  if (!ZAPIER_WEBHOOK_URL) {
-    console.log("No ZAPIER_WEBHOOK_URL set – skipping summary");
-    return;
-  }
+  if (!ZAPIER_WEBHOOK_URL) return;
 
   try {
     const url = new URL(ZAPIER_WEBHOOK_URL);
@@ -75,43 +74,55 @@ function sendToZapier(payload) {
   }
 }
 
-// Process the next call in the queue if we have capacity
-async function processQueue() {
-  if (activeCallsCount >= MAX_CONCURRENT_CALLS || callQueue.length === 0) {
-    return;
-  }
-
-  const job = callQueue.shift();
-  activeCallsCount++;
-
-  console.log(`Starting queued call. Active: ${activeCallsCount} | Waiting: ${callQueue.length}`);
-
-  try {
-    const twimlUrl = `${HOSTNAME}/outbound-twiml?patient_name=${encodeURIComponent(job.patient_name)}&phone_number=${encodeURIComponent(job.to)}&agent_type=${encodeURIComponent(job.agent_type)}`;
-
-    const call = await twilioClient.calls.create({
-      to: job.to,
-      from: VERIFIED_CALLER_ID || TWILIO_PHONE_NUMBER,
-      url: twimlUrl,
-      method: "POST",
-    });
-
-    console.log(`Call started → ${job.to} | SID: ${call.sid} | Name: ${job.patient_name} | Type: ${job.agent_type}`);
-  } catch (err) {
-    console.error("Failed to start queued call:", err.message);
-    activeCallsCount = Math.max(0, activeCallsCount - 1);
-    processQueue(); // try next one
-  }
+function getActiveCount() {
+  return activeCalls.size;
 }
 
-// When a call ends we free a slot and process the next one
-function onCallFinished() {
-  activeCallsCount = Math.max(0, activeCallsCount - 1);
-  console.log(`Call finished. Active: ${activeCallsCount} | Waiting: ${callQueue.length}`);
+function markCallFinished(callSid, reason = "finished") {
+  if (!callSid) return;
+
+  const entry = activeCalls.get(callSid);
+  if (!entry) return;                 // already cleaned up
+
+  if (entry.timeout) clearTimeout(entry.timeout);
+  activeCalls.delete(callSid);
+
+  console.log(`Call ${callSid} ${reason}. Active: ${getActiveCount()} | Waiting: ${callQueue.length}`);
   processQueue();
 }
 
-// ===== API to start a call (now goes into the queue) =====
+async function processQueue() {
+  while (getActiveCount() < MAX_CONCURRENT_CALLS && callQueue.length > 0) {
+    const job = callQueue.shift();
+
+    try {
+      const twimlUrl = `${HOSTNAME}/outbound-twiml?patient_name=${encodeURIComponent(job.patient_name)}&phone_number=${encodeURIComponent(job.to)}&agent_type=${encodeURIComponent(job.agent_type)}`;
+
+      const call = await twilioClient.calls.create({
+        to: job.to,
+        from: VERIFIED_CALLER_ID || TWILIO_PHONE_NUMBER,
+        url: twimlUrl,
+        method: "POST",
+      });
+
+      const callSid = call.sid;
+
+      // Track this call and set a timeout
+      const timeout = setTimeout(() => {
+        markCallFinished(callSid, "timed out (never connected)");
+      }, CALL_TIMEOUT_MS);
+
+      activeCalls.set(callSid, { finished: false, timeout });
+
+      console.log(`Call started → ${job.to} | SID: ${callSid} | Name: ${job.patient_name} | Type: ${job.agent_type} | Active: ${getActiveCount()} | Waiting: ${callQueue.length}`);
+    } catch (err) {
+      console.error("Failed to start queued call:", err.message);
+      // continue to next job
+    }
+  }
+}
+
+// ===== API =====
 app.post("/api/call", async (req, res) => {
   try {
     const { to, patient_name, agent_type = "welcome" } = req.body;
@@ -120,18 +131,16 @@ app.post("/api/call", async (req, res) => {
       return res.status(400).json({ error: "Missing 'to' or 'patient_name'" });
     }
 
-    // Add to queue
     callQueue.push({ to, patient_name, agent_type });
     console.log(`Call queued for ${patient_name}. Queue length: ${callQueue.length}`);
 
-    // Try to start it if we have capacity
     processQueue();
 
     res.json({
       success: true,
       message: "Call queued",
-      queue_position: callQueue.length,
-      active_calls: activeCallsCount,
+      queue_length: callQueue.length,
+      active_calls: getActiveCount(),
     });
   } catch (err) {
     console.error("Queue error:", err.message);
@@ -139,7 +148,6 @@ app.post("/api/call", async (req, res) => {
   }
 });
 
-// TwiML that starts the Media Stream
 app.post("/outbound-twiml", (req, res) => {
   const patientName = req.query.patient_name || "there";
   const phoneNumber = req.query.phone_number || "";
@@ -159,7 +167,6 @@ app.post("/outbound-twiml", (req, res) => {
   res.type("text/xml").send(twiml);
 });
 
-// TwiML used when transferring the call
 app.post("/transfer-twiml", (req, res) => {
   const department = req.query.department || "admin";
   const targetNumber = TRANSFER_NUMBERS[department] || TRANSFER_NUMBERS.admin;
@@ -175,7 +182,7 @@ app.post("/transfer-twiml", (req, res) => {
   res.type("text/xml").send(twiml);
 });
 
-// Media Stream ↔ xAI bridge
+// Media Stream ↔ xAI
 app.ws("/media-stream", (twilioWs, req) => {
   console.log("Twilio Media Stream connected");
 
@@ -200,6 +207,13 @@ app.ws("/media-stream", (twilioWs, req) => {
         phoneNumber = data.start.customParameters?.phone_number || "unknown";
         agentType = data.start.customParameters?.agent_type || "welcome";
         console.log(`Stream started | Patient: ${patientName} | Type: ${agentType} | CallSid: ${callSid}`);
+
+        // Clear the timeout because the call did connect
+        const entry = activeCalls.get(callSid);
+        if (entry && entry.timeout) {
+          clearTimeout(entry.timeout);
+          entry.timeout = null;
+        }
 
         let baseInstructions = AGENT_INSTRUCTIONS_WELCOME;
         if (agentType === "patient_update" || agentType === "experience") {
@@ -264,7 +278,6 @@ Available departments: clinical, nurse, therapy, billing, admin.`;
             console.error("xAI error details:", JSON.stringify(event, null, 2));
           }
 
-          // Handle transfer
           if (event.type === "response.function_call_arguments.done") {
             try {
               const args = JSON.parse(event.arguments || "{}");
@@ -284,7 +297,6 @@ Available departments: clinical, nurse, therapy, billing, admin.`;
             }
           }
 
-          // Transcript collection
           if (event.type === "response.output_audio_transcript.done" && event.transcript) {
             const text = event.transcript.trim();
             if (text && (transcript.length === 0 || transcript[transcript.length - 1].text !== text)) {
@@ -299,7 +311,6 @@ Available departments: clinical, nurse, therapy, billing, admin.`;
             }
           }
 
-          // Audio to Twilio
           if (event.type === "response.output_audio.delta" && event.delta) {
             if (twilioWs.readyState === WebSocket.OPEN) {
               twilioWs.send(JSON.stringify({
@@ -311,8 +322,8 @@ Available departments: clinical, nurse, therapy, billing, admin.`;
           }
         });
 
-        xaiWs.on("close", (code, reason) => {
-          console.log("xAI connection closed. Code:", code, "Reason:", reason?.toString());
+        xaiWs.on("close", () => {
+          console.log("xAI connection closed");
         });
 
         xaiWs.on("error", (err) => console.error("xAI error:", err.message));
@@ -334,20 +345,16 @@ Available departments: clinical, nurse, therapy, billing, admin.`;
           .map((t) => `${t.speaker}: ${t.text}`)
           .join("\n");
 
-        const summaryPayload = {
+        sendToZapier({
           patient_name: patientName,
           phone_number: phoneNumber,
           agent_type: agentType,
           timestamp: callStartTime,
           transcript: fullTranscript || "No transcript captured",
           summary: `Call with ${patientName} (${agentType}) completed. See transcript for details.`,
-        };
+        });
 
-        sendToZapier(summaryPayload);
-
-        // Free the slot and process next call in queue
-        onCallFinished();
-
+        markCallFinished(callSid, "finished");
         if (xaiWs) xaiWs.close();
         break;
     }
@@ -355,8 +362,7 @@ Available departments: clinical, nurse, therapy, billing, admin.`;
 
   twilioWs.on("close", () => {
     console.log("Twilio connection closed");
-    // Safety: free the slot if the stream closes unexpectedly
-    onCallFinished();
+    markCallFinished(callSid, "stream closed");
     if (xaiWs) xaiWs.close();
   });
 });
