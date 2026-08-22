@@ -31,6 +31,11 @@ const TRANSFER_NUMBERS = {
   admin: "+12148077860",
 };
 
+// ===== Simple Queue Settings =====
+const MAX_CONCURRENT_CALLS = 8;          // Maximum calls running at the same time
+const callQueue = [];                    // Waiting calls
+let activeCallsCount = 0;                // Currently running calls
+
 if (!XAI_API_KEY || !TWILIO_ACCOUNT_SID || !TWILIO_AUTH_TOKEN || !TWILIO_PHONE_NUMBER) {
   console.error("Missing required environment variables");
   process.exit(1);
@@ -70,7 +75,43 @@ function sendToZapier(payload) {
   }
 }
 
-// Start outbound call
+// Process the next call in the queue if we have capacity
+async function processQueue() {
+  if (activeCallsCount >= MAX_CONCURRENT_CALLS || callQueue.length === 0) {
+    return;
+  }
+
+  const job = callQueue.shift();
+  activeCallsCount++;
+
+  console.log(`Starting queued call. Active: ${activeCallsCount} | Waiting: ${callQueue.length}`);
+
+  try {
+    const twimlUrl = `${HOSTNAME}/outbound-twiml?patient_name=${encodeURIComponent(job.patient_name)}&phone_number=${encodeURIComponent(job.to)}&agent_type=${encodeURIComponent(job.agent_type)}`;
+
+    const call = await twilioClient.calls.create({
+      to: job.to,
+      from: VERIFIED_CALLER_ID || TWILIO_PHONE_NUMBER,
+      url: twimlUrl,
+      method: "POST",
+    });
+
+    console.log(`Call started → ${job.to} | SID: ${call.sid} | Name: ${job.patient_name} | Type: ${job.agent_type}`);
+  } catch (err) {
+    console.error("Failed to start queued call:", err.message);
+    activeCallsCount = Math.max(0, activeCallsCount - 1);
+    processQueue(); // try next one
+  }
+}
+
+// When a call ends we free a slot and process the next one
+function onCallFinished() {
+  activeCallsCount = Math.max(0, activeCallsCount - 1);
+  console.log(`Call finished. Active: ${activeCallsCount} | Waiting: ${callQueue.length}`);
+  processQueue();
+}
+
+// ===== API to start a call (now goes into the queue) =====
 app.post("/api/call", async (req, res) => {
   try {
     const { to, patient_name, agent_type = "welcome" } = req.body;
@@ -79,19 +120,21 @@ app.post("/api/call", async (req, res) => {
       return res.status(400).json({ error: "Missing 'to' or 'patient_name'" });
     }
 
-    const twimlUrl = `${HOSTNAME}/outbound-twiml?patient_name=${encodeURIComponent(patient_name)}&phone_number=${encodeURIComponent(to)}&agent_type=${encodeURIComponent(agent_type)}`;
+    // Add to queue
+    callQueue.push({ to, patient_name, agent_type });
+    console.log(`Call queued for ${patient_name}. Queue length: ${callQueue.length}`);
 
-    const call = await twilioClient.calls.create({
-      to,
-      from: VERIFIED_CALLER_ID || TWILIO_PHONE_NUMBER,
-      url: twimlUrl,
-      method: "POST",
+    // Try to start it if we have capacity
+    processQueue();
+
+    res.json({
+      success: true,
+      message: "Call queued",
+      queue_position: callQueue.length,
+      active_calls: activeCallsCount,
     });
-
-    console.log(`Call started → ${to} | SID: ${call.sid} | Name: ${patient_name} | Type: ${agent_type}`);
-    res.json({ success: true, callSid: call.sid });
   } catch (err) {
-    console.error("Call failed:", err.message);
+    console.error("Queue error:", err.message);
     res.status(500).json({ error: err.message });
   }
 });
@@ -302,6 +345,9 @@ Available departments: clinical, nurse, therapy, billing, admin.`;
 
         sendToZapier(summaryPayload);
 
+        // Free the slot and process next call in queue
+        onCallFinished();
+
         if (xaiWs) xaiWs.close();
         break;
     }
@@ -309,6 +355,8 @@ Available departments: clinical, nurse, therapy, billing, admin.`;
 
   twilioWs.on("close", () => {
     console.log("Twilio connection closed");
+    // Safety: free the slot if the stream closes unexpectedly
+    onCallFinished();
     if (xaiWs) xaiWs.close();
   });
 });
@@ -317,4 +365,5 @@ app.get("/", (req, res) => res.send("xAI ↔ Twilio Outbound Bridge is running")
 
 app.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
+  console.log(`Max concurrent calls: ${MAX_CONCURRENT_CALLS}`);
 });
