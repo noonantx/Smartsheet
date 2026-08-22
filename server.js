@@ -23,7 +23,6 @@ const ZAPIER_WEBHOOK_URL = process.env.ZAPIER_WEBHOOK_URL;
 const AGENT_INSTRUCTIONS_WELCOME = process.env.AGENT_INSTRUCTIONS_WELCOME || process.env.AGENT_INSTRUCTIONS || "You are a helpful assistant.";
 const AGENT_INSTRUCTIONS_PATIENT_UPDATE = process.env.AGENT_INSTRUCTIONS_PATIENT_UPDATE || process.env.AGENT_INSTRUCTIONS_EXPERIENCE || "You are a helpful assistant calling to check on the patient.";
 
-// Department phone numbers
 const TRANSFER_NUMBERS = {
   clinical: "+12148107225",
   nurse: "+12142530980",
@@ -39,9 +38,12 @@ if (!XAI_API_KEY || !TWILIO_ACCOUNT_SID || !TWILIO_AUTH_TOKEN || !TWILIO_PHONE_N
 
 const twilioClient = twilio(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN);
 
+// Store basic call info so status callback can use it
+const activeCalls = new Map();
+
 function sendToZapier(payload) {
   if (!ZAPIER_WEBHOOK_URL) {
-    console.log("No ZAPIER_WEBHOOK_URL set – skipping summary");
+    console.log("No ZAPIER_WEBHOOK_URL set – skipping");
     return;
   }
 
@@ -71,6 +73,17 @@ function sendToZapier(payload) {
   }
 }
 
+function mapTwilioStatus(status) {
+  switch (status) {
+    case "completed": return "Answered";
+    case "no-answer": return "No Answer";
+    case "busy": return "Busy";
+    case "failed": return "Failed";
+    case "canceled": return "Canceled";
+    default: return status || "Unknown";
+  }
+}
+
 // Start outbound call
 app.post("/api/call", async (req, res) => {
   try {
@@ -81,12 +94,24 @@ app.post("/api/call", async (req, res) => {
     }
 
     const twimlUrl = `${HOSTNAME}/outbound-twiml?patient_name=${encodeURIComponent(patient_name)}&phone_number=${encodeURIComponent(to)}&agent_type=${encodeURIComponent(agent_type)}`;
+    const statusCallbackUrl = `${HOSTNAME}/call-status`;
 
     const call = await twilioClient.calls.create({
       to,
       from: VERIFIED_CALLER_ID || TWILIO_PHONE_NUMBER,
       url: twimlUrl,
       method: "POST",
+      statusCallback: statusCallbackUrl,
+      statusCallbackEvent: ["completed", "busy", "no-answer", "failed", "canceled"],
+      statusCallbackMethod: "POST",
+    });
+
+    // Store info for later status callback
+    activeCalls.set(call.sid, {
+      patient_name,
+      phone_number: to,
+      agent_type,
+      start_time: new Date().toISOString(),
     });
 
     console.log(`Call started → ${to} | SID: ${call.sid} | Name: ${patient_name} | Type: ${agent_type}`);
@@ -95,6 +120,34 @@ app.post("/api/call", async (req, res) => {
     console.error("Call failed:", err.message);
     res.status(500).json({ error: err.message });
   }
+});
+
+// Twilio status callback – this is where we learn the final outcome
+app.post("/call-status", (req, res) => {
+  const callSid = req.body.CallSid;
+  const callStatus = req.body.CallStatus;
+  const outcome = mapTwilioStatus(callStatus);
+
+  console.log(`Call status for ${callSid}: ${callStatus} → ${outcome}`);
+
+  const callInfo = activeCalls.get(callSid) || {};
+
+  // Send outcome to Zapier so it can update Smartsheet
+  sendToZapier({
+    event_type: "call_outcome",
+    call_sid: callSid,
+    patient_name: callInfo.patient_name || "",
+    phone_number: callInfo.phone_number || req.body.To || "",
+    agent_type: callInfo.agent_type || "",
+    call_outcome: outcome,
+    twilio_status: callStatus,
+    timestamp: new Date().toISOString(),
+  });
+
+  // Clean up
+  activeCalls.delete(callSid);
+
+  res.sendStatus(200);
 });
 
 // TwiML that starts the Media Stream
@@ -188,7 +241,7 @@ Available departments: clinical, nurse, therapy, billing, admin.`;
                 {
                   type: "function",
                   name: "transfer_call",
-                  description: "Transfer the current call to a specific department. Use this when the patient asks to speak with clinical management, nurse scheduling, therapy scheduling, billing, or administration.",
+                  description: "Transfer the current call to a specific department.",
                   parameters: {
                     type: "object",
                     properties: {
@@ -216,14 +269,13 @@ Available departments: clinical, nurse, therapy, billing, admin.`;
 
         xaiWs.on("message", async (xaiMsg) => {
           const event = JSON.parse(xaiMsg.toString());
-
           console.log("xAI event:", event.type);
 
           if (event.type === "error") {
             console.error("xAI error details:", JSON.stringify(event, null, 2));
           }
 
-          // Handle tool call (transfer)
+          // Handle transfer
           if (event.type === "response.function_call_arguments.done") {
             try {
               const args = JSON.parse(event.arguments || "{}");
@@ -232,12 +284,10 @@ Available departments: clinical, nurse, therapy, billing, admin.`;
 
               if (callSid) {
                 const transferUrl = `${HOSTNAME}/transfer-twiml?department=${encodeURIComponent(department)}`;
-
                 await twilioClient.calls(callSid).update({
                   url: transferUrl,
                   method: "POST",
                 });
-
                 console.log(`Call ${callSid} redirected to ${department}`);
               }
             } catch (err) {
@@ -245,7 +295,7 @@ Available departments: clinical, nurse, therapy, billing, admin.`;
             }
           }
 
-          // Transcript collection
+          // Transcript
           if (event.type === "response.output_audio_transcript.done" && event.transcript) {
             const text = event.transcript.trim();
             if (text && (transcript.length === 0 || transcript[transcript.length - 1].text !== text)) {
@@ -276,9 +326,7 @@ Available departments: clinical, nurse, therapy, billing, admin.`;
           console.log("xAI connection closed. Code:", code, "Reason:", reason?.toString());
         });
 
-        xaiWs.on("error", (err) => {
-          console.error("xAI error:", err.message);
-        });
+        xaiWs.on("error", (err) => console.error("xAI error:", err.message));
         break;
 
       case "media":
@@ -291,22 +339,21 @@ Available departments: clinical, nurse, therapy, billing, admin.`;
         break;
 
       case "stop":
-        console.log("Stream stopped – sending summary to Zapier");
+        console.log("Stream stopped – sending transcript to Zapier");
 
         const fullTranscript = transcript
           .map((t) => `${t.speaker}: ${t.text}`)
           .join("\n");
 
-        const summaryPayload = {
+        sendToZapier({
+          event_type: "call_transcript",
           patient_name: patientName,
           phone_number: phoneNumber,
           agent_type: agentType,
           timestamp: callStartTime,
           transcript: fullTranscript || "No transcript captured",
           summary: `Call with ${patientName} (${agentType}) completed. See transcript for details.`,
-        };
-
-        sendToZapier(summaryPayload);
+        });
 
         if (xaiWs) xaiWs.close();
         break;
