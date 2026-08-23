@@ -31,9 +31,9 @@ const TRANSFER_NUMBERS = {
   admin: "+12148077860",
 };
 
-// ===== Queue Settings =====
-const MAX_CONCURRENT_CALLS = 8;
-const CALL_TIMEOUT_MS = 60000;
+// ===== Queue Settings (Pro Ultra) =====
+const MAX_CONCURRENT_CALLS = 60;
+const CALL_TIMEOUT_MS = 90000; // 90 seconds
 
 const callQueue = [];
 const activeCalls = new Map(); // callSid → { timeout }
