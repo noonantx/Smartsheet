@@ -31,12 +31,12 @@ const TRANSFER_NUMBERS = {
   admin: "+12148077860",
 };
 
-// ===== Improved Queue =====
+// ===== Queue Settings =====
 const MAX_CONCURRENT_CALLS = 8;
-const CALL_TIMEOUT_MS = 60000; // 60 seconds – free the slot if call never connects
+const CALL_TIMEOUT_MS = 60000;
 
-const callQueue = [];                 // jobs waiting to start
-const activeCalls = new Map();        // callSid → { finished: boolean, timeout }
+const callQueue = [];
+const activeCalls = new Map(); // callSid → { timeout }
 
 if (!XAI_API_KEY || !TWILIO_ACCOUNT_SID || !TWILIO_AUTH_TOKEN || !TWILIO_PHONE_NUMBER) {
   console.error("Missing required environment variables");
@@ -74,15 +74,26 @@ function sendToZapier(payload) {
   }
 }
 
+function closeXaiConnection(xaiWs, reason = "closed") {
+  if (!xaiWs) return;
+  try {
+    if (xaiWs.readyState === WebSocket.OPEN || xaiWs.readyState === WebSocket.CONNECTING) {
+      xaiWs.close();
+      console.log(`xAI connection ${reason}`);
+    }
+  } catch (err) {
+    console.error("Error closing xAI connection:", err.message);
+  }
+}
+
 function getActiveCount() {
   return activeCalls.size;
 }
 
 function markCallFinished(callSid, reason = "finished") {
   if (!callSid) return;
-
   const entry = activeCalls.get(callSid);
-  if (!entry) return;                 // already cleaned up
+  if (!entry) return;
 
   if (entry.timeout) clearTimeout(entry.timeout);
   activeCalls.delete(callSid);
@@ -107,17 +118,15 @@ async function processQueue() {
 
       const callSid = call.sid;
 
-      // Track this call and set a timeout
       const timeout = setTimeout(() => {
         markCallFinished(callSid, "timed out (never connected)");
       }, CALL_TIMEOUT_MS);
 
-      activeCalls.set(callSid, { finished: false, timeout });
+      activeCalls.set(callSid, { timeout });
 
       console.log(`Call started → ${job.to} | SID: ${callSid} | Name: ${job.patient_name} | Type: ${job.agent_type} | Active: ${getActiveCount()} | Waiting: ${callQueue.length}`);
     } catch (err) {
       console.error("Failed to start queued call:", err.message);
-      // continue to next job
     }
   }
 }
@@ -208,7 +217,7 @@ app.ws("/media-stream", (twilioWs, req) => {
         agentType = data.start.customParameters?.agent_type || "welcome";
         console.log(`Stream started | Patient: ${patientName} | Type: ${agentType} | CallSid: ${callSid}`);
 
-        // Clear the timeout because the call did connect
+        // Clear timeout – call connected
         const entry = activeCalls.get(callSid);
         if (entry && entry.timeout) {
           clearTimeout(entry.timeout);
@@ -278,6 +287,7 @@ Available departments: clinical, nurse, therapy, billing, admin.`;
             console.error("xAI error details:", JSON.stringify(event, null, 2));
           }
 
+          // Transfer handling
           if (event.type === "response.function_call_arguments.done") {
             try {
               const args = JSON.parse(event.arguments || "{}");
@@ -297,20 +307,40 @@ Available departments: clinical, nurse, therapy, billing, admin.`;
             }
           }
 
+          // Improved Transcript Logic
           if (event.type === "response.output_audio_transcript.done" && event.transcript) {
             const text = event.transcript.trim();
-            if (text && (transcript.length === 0 || transcript[transcript.length - 1].text !== text)) {
-              transcript.push({ speaker: "Agent", text });
+            if (text) {
+              if (transcript.length > 0 && transcript[transcript.length - 1].speaker === "Agent") {
+                const last = transcript[transcript.length - 1].text;
+                if (text.startsWith(last) || last.startsWith(text)) {
+                  transcript[transcript.length - 1].text = text.length > last.length ? text : last;
+                } else {
+                  transcript.push({ speaker: "Agent", text });
+                }
+              } else {
+                transcript.push({ speaker: "Agent", text });
+              }
             }
           }
 
           if (event.type === "conversation.item.input_audio_transcription.completed" && event.transcript) {
             const text = event.transcript.trim();
-            if (text && (transcript.length === 0 || transcript[transcript.length - 1].text !== text)) {
-              transcript.push({ speaker: "Patient", text });
+            if (text) {
+              if (transcript.length > 0 && transcript[transcript.length - 1].speaker === "Patient") {
+                const last = transcript[transcript.length - 1].text;
+                if (text.startsWith(last) || last.startsWith(text)) {
+                  transcript[transcript.length - 1].text = text.length > last.length ? text : last;
+                } else {
+                  transcript.push({ speaker: "Patient", text });
+                }
+              } else {
+                transcript.push({ speaker: "Patient", text });
+              }
             }
           }
 
+          // Audio to Twilio
           if (event.type === "response.output_audio.delta" && event.delta) {
             if (twilioWs.readyState === WebSocket.OPEN) {
               twilioWs.send(JSON.stringify({
@@ -326,7 +356,11 @@ Available departments: clinical, nurse, therapy, billing, admin.`;
           console.log("xAI connection closed");
         });
 
-        xaiWs.on("error", (err) => console.error("xAI error:", err.message));
+        xaiWs.on("error", (err) => {
+          console.error("xAI error:", err.message);
+          closeXaiConnection(xaiWs, "closed after error");
+          xaiWs = null;
+        });
         break;
 
       case "media":
@@ -355,7 +389,8 @@ Available departments: clinical, nurse, therapy, billing, admin.`;
         });
 
         markCallFinished(callSid, "finished");
-        if (xaiWs) xaiWs.close();
+        closeXaiConnection(xaiWs, "closed after stop");
+        xaiWs = null;
         break;
     }
   });
@@ -363,7 +398,8 @@ Available departments: clinical, nurse, therapy, billing, admin.`;
   twilioWs.on("close", () => {
     console.log("Twilio connection closed");
     markCallFinished(callSid, "stream closed");
-    if (xaiWs) xaiWs.close();
+    closeXaiConnection(xaiWs, "closed after Twilio close");
+    xaiWs = null;
   });
 });
 
