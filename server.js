@@ -108,7 +108,12 @@ async function processQueue() {
     const job = callQueue.shift();
 
     try {
-      const twimlUrl = `${HOSTNAME}/outbound-twiml?patient_name=${encodeURIComponent(job.patient_name)}&phone_number=${encodeURIComponent(job.to)}&agent_type=${encodeURIComponent(job.agent_type)}`;
+      // Build TwiML URL and include discharge_date if present
+      let twimlUrl = `${HOSTNAME}/outbound-twiml?patient_name=${encodeURIComponent(job.patient_name)}&phone_number=${encodeURIComponent(job.to)}&agent_type=${encodeURIComponent(job.agent_type)}`;
+      
+      if (job.discharge_date) {
+        twimlUrl += `&discharge_date=${encodeURIComponent(job.discharge_date)}`;
+      }
 
       const call = await twilioClient.calls.create({
         to: job.to,
@@ -125,7 +130,7 @@ async function processQueue() {
 
       activeCalls.set(callSid, { timeout });
 
-      console.log(`Call started → ${job.to} | SID: ${callSid} | Name: ${job.patient_name} | Type: ${job.agent_type} | Active: ${getActiveCount()} | Waiting: ${callQueue.length}`);
+      console.log(`Call started → ${job.to} | SID: ${callSid} | Name: ${job.patient_name} | Type: ${job.agent_type} | Discharge: ${job.discharge_date || "n/a"} | Active: ${getActiveCount()} | Waiting: ${callQueue.length}`);
     } catch (err) {
       console.error("Failed to start queued call:", err.message);
     }
@@ -135,13 +140,13 @@ async function processQueue() {
 // ===== API =====
 app.post("/api/call", async (req, res) => {
   try {
-    const { to, patient_name, agent_type = "welcome" } = req.body;
+    const { to, patient_name, agent_type = "welcome", discharge_date = null } = req.body;
 
     if (!to || !patient_name) {
       return res.status(400).json({ error: "Missing 'to' or 'patient_name'" });
     }
 
-    callQueue.push({ to, patient_name, agent_type });
+    callQueue.push({ to, patient_name, agent_type, discharge_date });
     console.log(`Call queued for ${patient_name}. Queue length: ${callQueue.length}`);
 
     processQueue();
@@ -162,6 +167,7 @@ app.post("/outbound-twiml", (req, res) => {
   const patientName = req.query.patient_name || "there";
   const phoneNumber = req.query.phone_number || "";
   const agentType = req.query.agent_type || "welcome";
+  const dischargeDate = req.query.discharge_date || "";
 
   const twiml = `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
@@ -170,6 +176,7 @@ app.post("/outbound-twiml", (req, res) => {
       <Parameter name="patient_name" value="${patientName}" />
       <Parameter name="phone_number" value="${phoneNumber}" />
       <Parameter name="agent_type" value="${agentType}" />
+      <Parameter name="discharge_date" value="${dischargeDate}" />
     </Stream>
   </Connect>
 </Response>`;
@@ -201,6 +208,7 @@ app.ws("/media-stream", (twilioWs, req) => {
   let patientName = "there";
   let phoneNumber = "unknown";
   let agentType = "welcome";
+  let dischargeDate = null;
   let xaiWs = null;
   let sessionReady = false;
   let transcript = [];
@@ -216,7 +224,9 @@ app.ws("/media-stream", (twilioWs, req) => {
         patientName = data.start.customParameters?.patient_name || "there";
         phoneNumber = data.start.customParameters?.phone_number || "unknown";
         agentType = data.start.customParameters?.agent_type || "welcome";
-        console.log(`Stream started | Patient: ${patientName} | Type: ${agentType} | CallSid: ${callSid}`);
+        dischargeDate = data.start.customParameters?.discharge_date || null;
+
+        console.log(`Stream started | Patient: ${patientName} | Type: ${agentType} | Discharge Date: ${dischargeDate || "n/a"} | CallSid: ${callSid}`);
 
         // Clear timeout – call connected
         const entry = activeCalls.get(callSid);
@@ -240,11 +250,16 @@ app.ws("/media-stream", (twilioWs, req) => {
         xaiWs.on("open", () => {
           console.log("Connected to xAI Realtime");
 
-          const fullInstructions = `${baseInstructions}
+          // Build final instructions and inject discharge date when available
+          let fullInstructions = `${baseInstructions}
 
-The patient's name is ${patientName}. Always address them by name and confirm you are speaking with them at the beginning of the call.
+The patient's name is ${patientName}. Always address them by name and confirm you are speaking with them at the beginning of the call.`;
 
-You have a tool called transfer_call. Use it when the patient wants to be transferred to a department.
+          if (dischargeDate) {
+            fullInstructions += `\n\nThe patient was discharged on ${dischargeDate}. Use this date naturally in the conversation when relevant.`;
+          }
+
+          fullInstructions += `\n\nYou have a tool called transfer_call. Use it when the patient wants to be transferred to a department.
 Available departments: clinical, nurse, therapy, billing, admin.`;
 
           const sessionUpdate = {
@@ -387,6 +402,7 @@ Available departments: clinical, nurse, therapy, billing, admin.`;
           patient_name: patientName,
           phone_number: phoneNumber,
           agent_type: agentType,
+          discharge_date: dischargeDate,
           timestamp: callStartTime,
           transcript: fullTranscript || "No transcript captured",
           summary: `Call with ${patientName} (${agentType}) completed. See transcript for details.`,
