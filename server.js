@@ -22,6 +22,7 @@ const ZAPIER_WEBHOOK_URL = process.env.ZAPIER_WEBHOOK_URL;
 
 const AGENT_INSTRUCTIONS_WELCOME = process.env.AGENT_INSTRUCTIONS_WELCOME || process.env.AGENT_INSTRUCTIONS || "You are a helpful assistant.";
 const AGENT_INSTRUCTIONS_PATIENT_UPDATE = process.env.AGENT_INSTRUCTIONS_PATIENT_UPDATE || process.env.AGENT_INSTRUCTIONS_EXPERIENCE || "You are a helpful assistant calling to check on the patient.";
+const AGENT_INSTRUCTIONS_DISCHARGED = process.env.AGENT_INSTRUCTIONS_DISCHARGED || "You are a helpful assistant calling a discharged patient.";
 
 const TRANSFER_NUMBERS = {
   clinical: "+12148107225",
@@ -224,9 +225,12 @@ app.ws("/media-stream", (twilioWs, req) => {
           entry.timeout = null;
         }
 
+        // Choose instructions based on agent_type
         let baseInstructions = AGENT_INSTRUCTIONS_WELCOME;
         if (agentType === "patient_update" || agentType === "experience") {
           baseInstructions = AGENT_INSTRUCTIONS_PATIENT_UPDATE;
+        } else if (agentType === "discharged") {
+          baseInstructions = AGENT_INSTRUCTIONS_DISCHARGED;
         }
 
         xaiWs = new WebSocket("wss://api.x.ai/v1/realtime?model=grok-voice-latest", {
